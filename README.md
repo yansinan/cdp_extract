@@ -1,5 +1,7 @@
 # cdp-extract — CDP 网页内容提取插件
 
+**依赖：本地 Chrome/Chromium 需开启远程调试（`--remote-debugging-port=9222`）**
+
 Hermes Agent 的 `web_extract` provider。通过本地 Chrome DevTools Protocol 打开网页，
 滚动到底触发懒加载，获取完整 HTML，再经 Readability + Turndown 管道输出结构化 Markdown。
 
