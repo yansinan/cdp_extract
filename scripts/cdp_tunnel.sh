@@ -135,7 +135,7 @@ stop_tunnel() {
     echo "[start_remote_browser_tunnel]TUNNEL_STOPPED"
     return 0
   fi
-  pid=$(pgrep -f "-L ${LOCAL_FORWARD_PORT}:localhost:${REMOTE_DEBUG_PORT}" | head -n1 || true)
+  pid=$(pgrep -f "ssh.*-L ${LOCAL_FORWARD_PORT}:localhost:${REMOTE_DEBUG_PORT}" | head -n1 || true)
   if [ -n "$pid" ]; then
     kill "$pid" || true
     echo "[start_remote_browser_tunnel]TUNNEL_STOPPED pid=$pid"
