@@ -55,8 +55,8 @@ def _handle_cdp_tunnel(raw_args: str) -> str:
 def register(ctx) -> None:
     """注册 web_extract provider + /cdp_tunnel 斜杠命令。
 
-    CDP 隧道在 extract() / is_available() 中按需懒加载启动，
-    不需要额外 gateway hook。
+    插件加载时在后台线程尝试启动 CDP 隧道（不阻塞 CLI/gateway 启动），
+    隧道也会在 extract() / is_available() 中按需懒加载兜底。
     """
     ctx.register_web_search_provider(CDPExtractProvider())
 
@@ -67,3 +67,22 @@ def register(ctx) -> None:
         description="管理 CDP 隧道: status / start / stop / restart",
         args_hint="status|start|stop|restart",
     )
+
+    # 后台尝试启动隧道（不阻塞启动流程）
+    _start_tunnel_background()
+
+
+def _start_tunnel_background() -> None:
+    """后台线程启动隧道，不阻塞 CLI/gateway 启动。"""
+    import threading
+    def _run():
+        try:
+            from .provider import _ensure_cdp
+            if _ensure_cdp():
+                logger.info("CDP 隧道已就绪（后台启动）")
+            else:
+                logger.info("CDP 隧道未就绪（稍后 extract 时会重试）")
+        except Exception:
+            logger.debug("后台隧道启动跳过", exc_info=True)
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
