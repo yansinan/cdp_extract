@@ -107,6 +107,11 @@ google-chrome --remote-debugging-port=9222
 
 # 在 Hermes 会话中调用 web_extract
 web_extract("https://example.com/article")
+
+# 管理 CDP 隧道（对话中直接用斜杠命令）
+/cdp_tunnel status
+/cdp_tunnel start
+/cdp_tunnel stop
 ```
 
 ### 直接测试
