@@ -150,81 +150,69 @@ async def _cdp_send(ws, method: str, params: dict | None = None, msg_id: int = 1
 
 
 async def _scroll_to_bottom(ws, msg_id: int) -> int | None:
-    """页面内 JS 自控滚动 + Python 轮询等待完成标记。
+    """单命令 JS 自控滚动到底 — Python 真正 await 执行完成。
 
-    Runtime.evaluate 的 awaitPromise 无法处理 setTimeout/RAF（macrotask），
-    所以启动脚本后立即返回，JS 在页面中用 setInterval 自行滚动。
+    使用 Runtime.evaluate + awaitPromise: True。
+    JS 内部用 setInterval(50ms) 逐屏下滚，到底后 setTimeout(3s) 等懒加载，
+    全部完成后 return 最终 scrollHeight。
 
-    完成标记：window.__scrollDone = {height: N, ok: true}
-    Python 轮询该标记确认完成。
+    注意：awaitPromise 能处理 macrotask（setTimeout），但使用前必须确认
+    websocket 中没有残留的导航事件（否则 _cdp_send 需要跳过它们）。
+    这里所有 command 都用 _cdp_send（按 msg_id 过滤），不受残留事件影响。
 
     文档:
       - Runtime.evaluate: https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-evaluate
-      - window.scrollTo: https://developer.mozilla.org/en-US/docs/Web/API/Window/scrollTo
-      - setInterval: https://developer.mozilla.org/en-US/docs/Web/API/setInterval
+      - awaitPromise: https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-evaluate
     """
-    # 1) 获取初始高度
-    get_h = "document.scrollingElement ? document.scrollingElement.scrollHeight : document.body.scrollHeight"
-    resp = await _cdp_send(ws, "Runtime.evaluate",
-                           {"expression": get_h, "returnByValue": True}, msg_id=msg_id)
-    msg_id += 1
-    if "error" in resp:
-        return None
-    total = int(resp.get("result", {}).get("result", {}).get("value", 0))
-    if total <= 0:
-        return None
-
-    logger.info("启动滚动: 初始高度=%d, 间隔=50ms", total)
-
-    # 2) 注入滚动脚本（异步执行，立即返回）
-    # JS 自己控制节奏，注意发窗口滚动并和完成前保持标签页打开，
-    # 完成后写 window.__scrollDone 标记
     scroll_js = """
-        (function() {
+        (async () => {
             const el = document.scrollingElement;
             const step = 80;
             let pos = 0;
             let bottomCount = 0;
-            const iv = setInterval(() => {
-                pos += step;
-                window.scrollTo(0, pos);
-                if (window.scrollY + window.innerHeight >= el.scrollHeight) {
-                    bottomCount++;
-                    if (bottomCount >= 2) {
-                        // 到底了，等待 3 秒让懒加载渲染
-                        clearInterval(iv);
-                        setTimeout(() => {
-                            const h = el.scrollHeight;
-                            window.__scrollDone = {height: h, ok: true};
-                        }, 3000);
+
+            await new Promise((resolve) => {
+                const iv = setInterval(() => {
+                    pos += step;
+                    window.scrollTo(0, pos);
+
+                    if (window.scrollY + window.innerHeight >= el.scrollHeight) {
+                        bottomCount++;
+                        if (bottomCount >= 2) {
+                            clearInterval(iv);
+                            // 到底了，等 3 秒让懒加载渲染
+                            setTimeout(() => {
+                                const h = el.scrollHeight;
+                                resolve(h);
+                            }, 3000);
+                        }
                     }
-                }
-            }, 50);
+                }, 50);
+            });
+
+            // 返回最终高度
+            return el.scrollHeight;
         })()
     """
-    await _cdp_send(ws, "Runtime.evaluate",
-                    {"expression": scroll_js}, msg_id=msg_id)
-    msg_id += 1
 
-    # 3) 轮询 __scrollDone 标记（Python 等，但 JS 自控）
-    poll_expr = "window.__scrollDone"
-    for _ in range(120):  # 最大等 60s
-        await asyncio.sleep(0.5)
-        resp = await _cdp_send(ws, "Runtime.evaluate",
-                               {"expression": poll_expr, "returnByValue": True},
-                               msg_id=msg_id)
-        msg_id += 1
-        val = resp.get("result", {}).get("result", {}).get("value")
-        if isinstance(val, dict) and val.get("ok"):
-            h = int(val.get("height", 0))
-            logger.info("滚动完成: 高度=%d", h)
-            return h
-        if isinstance(val, dict) and val.get("error"):
-            logger.warning("滚动JS出错: %s", val["error"])
-            break
+    resp = await _cdp_send(ws, "Runtime.evaluate", {
+        "expression": scroll_js,
+        "awaitPromise": True,
+        "returnByValue": True,
+    }, msg_id=msg_id)
 
-    logger.warning("滚动超时或未完成")
-    return total
+    if "error" in resp:
+        logger.warning("滚动执行失败: %s", resp["error"])
+        return None
+    if "exceptionDetails" in resp:
+        logger.warning("滚动异常: %s", resp["exceptionDetails"])
+        return None
+
+    h = resp.get("result", {}).get("result", {}).get("value")
+    if h is not None:
+        logger.info("滚动完成: 高度=%s", int(h))
+        return int(h)
+    return None
 
 
 async def _fetch_raw_html(url: str) -> Dict[str, Any]:
