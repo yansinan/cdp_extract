@@ -12,7 +12,7 @@
  * Interface aligned with hermes-sidebar PageExtractionResult.
  */
 
-const { JSDOM } = require('jsdom');
+const { parseHTML } = require('linkedom');
 const { Readability } = require('@mozilla/readability');
 const TurndownService = require('turndown');
 const { gfm } = require('turndown-plugin-gfm');
@@ -147,10 +147,8 @@ function readDown(html, options = {}) {
 
   let article;
   try {
-    const dom = new JSDOM(html, {
-      url: options.url || 'about:blank',
-    });
-    const doc = dom.window.document;
+    const dom = parseHTML(html, options.url || undefined);
+    const doc = dom.document;
 
     debugLog(debugTrace, `  document.title = "${doc.title}"`);
     debugLog(debugTrace, `  document.documentElement.lang = "${doc.documentElement.lang || ''}"`);
@@ -226,9 +224,8 @@ function readDown(html, options = {}) {
     }
     turndown.remove(removals);
 
-    // Parse article HTML into DOM for Turndown
-    const articleDom = new JSDOM(result.html);
-    result.markdown = turndown.turndown(articleDom.window.document.body).trim();
+    // Turndown takes HTML string directly
+    result.markdown = turndown.turndown(result.html).trim();
 
     debugLog(debugTrace, `  markdown output: ${(result.markdown || '').length} chars`);
     debugLog(debugTrace, 'Step 2 complete');
@@ -256,8 +253,8 @@ function _rawExtract(html) {
   };
 
   try {
-    const dom = new JSDOM(html);
-    const doc = dom.window.document;
+    const dom = parseHTML(html);
+    const doc = dom.document;
 
     result.text = doc.body.textContent || '';
     result.html = doc.documentElement.outerHTML || undefined;
