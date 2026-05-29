@@ -6,7 +6,7 @@ Uses html.parser / lxml for content extraction — no external SDK required.
 
 from __future__ import annotations
 
-from plugins.web.cdp_extract.provider import CDPExtractProvider
+from .provider import CDPExtractProvider
 
 
 def register(ctx) -> None:
