@@ -1,6 +1,11 @@
-"""CDP web extract provider — fetch HTML via Chrome CDP, extract via read_down (Node.js).
+"""
+CDP web extract provider — fetch HTML via Chrome CDP, extract via read_down (Node.js).
 
-Phase 2: CDP fetch + Readability + Turndown pipeline.
+文档参考:
+  - CDP Page domain: https://chromedevtools.github.io/devtools-protocol/tot/Page/
+  - CDP Runtime domain: https://chromedevtools.github.io/devtools-protocol/tot/Runtime/
+  - MDN scrollingElement: https://developer.mozilla.org/en-US/docs/Web/API/Document/scrollingElement
+  - MDN scrollTo: https://developer.mozilla.org/en-US/docs/Web/API/Window/scrollTo
 """
 
 from __future__ import annotations
@@ -20,7 +25,8 @@ from agent.web_search_provider import WebSearchProvider
 logger = logging.getLogger(__name__)
 
 CDP_URL = "http://127.0.0.1:9222"
-PAGE_TIMEOUT = 30
+PAGE_TIMEOUT = 30  # 单次 CDP 命令超时
+SCROLL_TIMEOUT = 60  # 滚动脚本超时（含 3 秒底部等待）
 READ_DOWN_INDEX = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "read_down", "index.js",
@@ -28,14 +34,14 @@ READ_DOWN_INDEX = os.path.join(
 
 
 # ---------------------------------------------------------------------------
-# read_down bridge
+# read_down 桥接层
 # ---------------------------------------------------------------------------
 
 
 def _call_readdown(html: str, url: str = "", debug: bool = False) -> Dict[str, Any]:
-    """Run read_down (Node.js) on raw HTML, return structured result.
+    """调用 read_down (Node.js) 处理原始 HTML，返回结构化结果。
 
-    CLI interface:
+    CLI 接口:
       stdin  → {"html": "...", "url": "...", "options": {"debugTrace": bool}}
       stdout → {"markdown": "...", "text": "...", "title": "...", ...}
     """
@@ -71,19 +77,28 @@ def _call_readdown(html: str, url: str = "", debug: bool = False) -> Dict[str, A
 
 
 # ---------------------------------------------------------------------------
-# CDP helpers
+# CDP 底层辅助
 # ---------------------------------------------------------------------------
 
 
 def _get_browser_ws_url() -> str:
-    """Get the browser-level WebSocket debugger URL from CDP."""
+    """获取浏览器级 WebSocket URL。
+
+    文档: https://chromedevtools.github.io/devtools-protocol/tot/#endpoints
+    GET /json/version → webSocketDebuggerUrl (ws://.../devtools/browser/<id>)
+    """
     resp = requests.get(f"{CDP_URL}/json/version", timeout=5)
     resp.raise_for_status()
     return resp.json()["webSocketDebuggerUrl"]
 
 
 async def _create_target(browser_ws: str) -> tuple[str, str]:
-    """Create a new page target, return (target_id, target_ws_url)."""
+    """创建新标签页（页面目标）。
+
+    文档: https://chromedevtools.github.io/devtools-protocol/tot/Target/#method-createTarget
+    通过浏览器 WS 发送 Target.createTarget，返回 targetId。
+    然后从 GET /json 列表中找到对应的 page WebSocket URL。
+    """
     async with websockets.connect(browser_ws, max_size=None) as ws:
         msg = {"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}
         await ws.send(json.dumps(msg))
@@ -93,6 +108,7 @@ async def _create_target(browser_ws: str) -> tuple[str, str]:
             raise RuntimeError(f"CDP Target.createTarget error: {result['error']}")
         target_id = result["result"]["targetId"]
 
+    # 从 REST 接口获取对应 page 的 WS URL
     targets_resp = requests.get(f"{CDP_URL}/json", timeout=5)
     for t in targets_resp.json():
         if t["id"] == target_id:
@@ -102,33 +118,103 @@ async def _create_target(browser_ws: str) -> tuple[str, str]:
 
 
 def _close_target(target_id: str) -> None:
-    """Close a CDP target."""
+    """关闭标签页。
+
+    文档: https://chromedevtools.github.io/devtools-protocol/tot/#endpoints
+    GET /json/close/<targetId>
+    """
     try:
         requests.get(f"{CDP_URL}/json/close/{target_id}", timeout=5)
     except Exception as exc:
-        logger.warning("Failed to close target %s: %s", target_id, exc)
+        logger.warning("关闭标签页失败 %s: %s", target_id, exc)
 
 
 async def _cdp_send(ws, method: str, params: dict | None = None, msg_id: int = 1) -> dict:
-    """Send a CDP command and wait for the matching response."""
+    """发送 CDP 命令并等待匹配的响应。
+
+    CDP 协议中，事件（有 method 无 id）和响应（id 匹配）交错到达。
+    该函数忽略事件，只返回与 msg_id 匹配的响应。
+
+    文档: https://chromedevtools.github.io/devtools-protocol/tot/#protocol
+    """
     payload: dict[str, Any] = {"id": msg_id, "method": method}
     if params:
         payload["params"] = params
     await ws.send(json.dumps(payload))
+
     while True:
         raw = await asyncio.wait_for(ws.recv(), timeout=PAGE_TIMEOUT)
         msg = json.loads(raw)
         if msg.get("id") == msg_id:
             return msg
-        logger.debug("CDP event (skipped): %s", msg.get("method", msg))
+        logger.debug("CDP 事件（跳过）: %s", msg.get("method", msg))
+
+
+async def _scroll_to_bottom(ws, msg_id: int) -> int | None:
+    """通过 Runtime.evaluate 执行滚动脚本，返回最终 scrollHeight。
+
+    文档:
+      - Runtime.evaluate: https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-evaluate
+        awaitPromise=True 表示等待异步函数完成再返回
+      - window.scrollTo: https://developer.mozilla.org/en-US/docs/Web/API/Window/scrollTo
+        同步滚动到指定坐标
+      - Document.scrollingElement: https://developer.mozilla.org/en-US/docs/Web/API/Document/scrollingElement
+        标准模式下返回 <html>, 其 scrollHeight 才是真实页面高度
+    """
+    # 使用 document.scrollingElement.scrollHeight 而非 document.body.scrollHeight
+    # 因为现代网页（标准模式）的滚动容器是 <html> 而非 <body>。
+    # 参考: https://developer.mozilla.org/en-US/docs/Web/API/Document/scrollingElement
+    scroll_js = """
+        (async () => {
+            const delay = ms => new Promise(r => setTimeout(r, ms));
+            const el = document.scrollingElement;
+            const total = el.scrollHeight;
+            const steps = 15;
+            const step = Math.max(Math.floor(total / steps), 80);
+            for (let y = 0; y <= total; y += step) {
+                window.scrollTo(0, y);
+                await delay(200);
+            }
+            // 到底后等待 3 秒，让懒加载内容有时间渲染
+            await delay(3000);
+            return document.scrollingElement.scrollHeight;
+        })()
+    """
+    await ws.send(json.dumps({
+        "id": msg_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": scroll_js,
+            "returnByValue": True,
+            "awaitPromise": True,  # 等待 async 函数 resolve
+        },
+    }))
+    scroll_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=SCROLL_TIMEOUT))
+    if "error" in scroll_resp:
+        logger.warning("滚动脚本执行失败: %s", scroll_resp["error"])
+        return None
+    h = scroll_resp.get("result", {}).get("result", {}).get("value")
+    if h is not None:
+        logger.info("滚动完成，最终高度=%s", h)
+    return h
 
 
 async def _fetch_raw_html(url: str) -> Dict[str, Any]:
-    """Open page via CDP → load → scroll to bottom → grab HTML.
+    """打开页面 → 等完全加载 → 滚动到底 → 抓取 HTML。
 
-    Page load detection uses lifecycleEvent('load') via CDP
-    Page.setLifecycleEventsEnabled — fires when window.onload
-    completes (all resources including images/scripts).
+    流程（每步标注文档来源）:
+      1. Page.enable — 开启页面域事件通知
+         https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-enable
+      2. Page.setLifecycleEventsEnabled({enabled: true}) — 开启生命周期事件
+         https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-setLifecycleEventsEnabled
+      3. Page.navigate(url) — 导航到目标 URL
+         https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-navigate
+      4. 等待 Page.lifecycleEvent(name='load') — 页面所有资源加载完毕
+         https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-lifecycleEvent
+         name='load' 对应 window.onload，确保图片/脚本全部完成
+      5. Runtime.evaluate — 执行滚动脚本（document.scrollingElement + window.scrollTo）
+      6. Runtime.evaluate — 取 document.title
+      7. Runtime.evaluate — 取 document.documentElement.outerHTML
     """
     result: Dict[str, Any] = {"url": url, "html": "", "title": "", "error": None}
     browser_ws = _get_browser_ws_url()
@@ -137,75 +223,60 @@ async def _fetch_raw_html(url: str) -> Dict[str, Any]:
 
     try:
         async with websockets.connect(target_ws, max_size=None) as ws:
+            # ---- 步骤 1: 开启 Page 域事件 ----
             await _cdp_send(ws, "Page.enable", msg_id=msg_id)
             msg_id += 1
 
-            # Enable lifecycle events (needed for load detection)
-            await _cdp_send(ws, "Page.setLifecycleEventsEnabled", {"enabled": True}, msg_id=msg_id)
+            # ---- 步骤 2: 开启生命周期事件（必须有才能收到 load 事件） ----
+            await _cdp_send(
+                ws, "Page.setLifecycleEventsEnabled",
+                {"enabled": True},
+                msg_id=msg_id,
+            )
             msg_id += 1
 
-            # Navigate — manually send then read events until load completes
+            # ---- 步骤 3: 导航到目标 URL ----
             await ws.send(json.dumps({
                 "id": msg_id,
                 "method": "Page.navigate",
                 "params": {"url": url},
             }))
-            navigate_responded = False
-            load_fired = False
 
-            while not (navigate_responded and load_fired):
+            # ---- 步骤 4: 等待导航响应 + lifecycle load 事件 ----
+            # 不使用 _cdp_send，因为需要同时接收事件和响应
+            navigate_ok = False
+            load_ok = False
+
+            while not (navigate_ok and load_ok):
                 raw = await asyncio.wait_for(ws.recv(), timeout=30)
                 msg = json.loads(raw)
                 mid = msg.get("id")
                 method = msg.get("method")
 
                 if mid == msg_id:
-                    navigate_responded = True
+                    # Page.navigate 的响应
+                    navigate_ok = True
                     if "error" in msg:
-                        raise RuntimeError(f"Page.navigate error: {msg['error']}")
+                        raise RuntimeError(f"导航失败: {msg['error']}")
+                    logger.debug("导航响应 OK")
                 elif method == "Page.lifecycleEvent":
+                    # 参考: https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-lifecycleEvent
                     evt_name = msg.get("params", {}).get("name", "")
                     if evt_name == "load":
-                        load_fired = True
-                        logger.debug("CDP lifecycle: load fired")
+                        load_ok = True
+                        logger.debug("页面加载完成 (lifecycle load)")
+                    elif evt_name == "DOMContentLoaded":
+                        logger.debug("DOM 解析完成")
                 else:
-                    logger.debug("CDP nav event: %s", method or mid)
+                    logger.debug("导航中事件: %s", method or mid)
 
-            msg_id += 1  # consume the navigate msg_id
+            msg_id += 1  # 已消耗 navigate 的 id
 
-            # Step 2: Scroll to bottom — 200ms intervals
-            scroll_script = """
-                (async () => {
-                    const delay = ms => new Promise(r => setTimeout(r, ms));
-                    const total = document.body.scrollHeight;
-                    const step = Math.max(Math.floor(total / 15), 80);
-                    for (let y = 0; y <= total; y += step) {
-                        window.scrollTo(0, y);
-                        await delay(200);
-                    }
-                    // Step 3: Wait 3 seconds at bottom
-                    await delay(3000);
-                    return document.body.scrollHeight;
-                })()
-            """
-            await ws.send(json.dumps({
-                "id": msg_id,
-                "method": "Runtime.evaluate",
-                "params": {
-                    "expression": scroll_script,
-                    "returnByValue": True,
-                    "awaitPromise": True,
-                },
-            }))
+            # ---- 步骤 5: 滚动到底部，触发懒加载 ----
+            await _scroll_to_bottom(ws, msg_id)
             msg_id += 1
-            scroll_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
-            if "error" in scroll_resp:
-                logger.warning("Scroll eval error: %s", scroll_resp["error"])
-            else:
-                h = scroll_resp.get("result", {}).get("result", {}).get("value", "?")
-                logger.info("CDP scroll done, height=%s", h)
 
-            # Step 4: Grab HTML
+            # ---- 步骤 6: 取页面标题 ----
             title_resp = await _cdp_send(
                 ws, "Runtime.evaluate",
                 {"expression": "document.title"},
@@ -215,17 +286,18 @@ async def _fetch_raw_html(url: str) -> Dict[str, Any]:
             if "result" in title_resp and "result" in title_resp["result"]:
                 result["title"] = title_resp["result"]["result"].get("value", "")
 
+            # ---- 步骤 7: 取完整 HTML ----
             html_resp = await _cdp_send(
                 ws, "Runtime.evaluate",
                 {"expression": "document.documentElement.outerHTML", "returnByValue": True},
                 msg_id,
             )
             if "error" in html_resp:
-                raise RuntimeError(f"Runtime.evaluate error: {html_resp['error']}")
+                raise RuntimeError(f"取 HTML 失败: {html_resp['error']}")
             result["html"] = html_resp["result"]["result"].get("value", "")
 
     except Exception as exc:
-        logger.warning("CDP fetch failed for %s: %s", url, exc)
+        logger.warning("CDP 抓取失败 %s: %s", url, exc)
         result["error"] = str(exc)
     finally:
         _close_target(target_id)
@@ -239,7 +311,7 @@ async def _fetch_raw_html(url: str) -> Dict[str, Any]:
 
 
 class CDPExtractProvider(WebSearchProvider):
-    """CDP-based web content extractor — Chrome DevTools + Readability + Turndown."""
+    """CDP 网页内容提取器 — Chrome DevTools → Readability → Turndown Markdown"""
 
     @property
     def name(self) -> str:
@@ -250,7 +322,7 @@ class CDPExtractProvider(WebSearchProvider):
         return "CDP Extract (Chrome DevTools + Readability + Turndown)"
 
     def is_available(self) -> bool:
-        """Return True when local CDP port 9222 and Node.js are reachable."""
+        """检查本地 CDP (port 9222) 和 Node.js 是否可用"""
         try:
             resp = requests.get(f"{CDP_URL}/json/version", timeout=3)
             if resp.status_code != 200:
@@ -267,18 +339,14 @@ class CDPExtractProvider(WebSearchProvider):
         return True
 
     async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
-        """Fetch each URL via Chrome CDP, then extract via read_down.
-
-        Returns:
-            List of per-URL result dicts with markdown, text, title, etc.
-        """
+        """对每个 URL: CDP 抓取 → read_down 提取 → 返回结构化结果"""
         logger.info("CDP extract: %d URL(s)", len(urls))
         results: List[Dict[str, Any]] = []
 
         for url in urls:
             logger.info("CDP extract: fetching %s", url)
 
-            # Step 1: CDP → raw HTML
+            # 步骤 1: CDP → 原始 HTML
             raw = await _fetch_raw_html(url)
 
             if raw.get("error") or not raw.get("html"):
@@ -290,14 +358,14 @@ class CDPExtractProvider(WebSearchProvider):
                 })
                 continue
 
-            # Step 2: read_down → structured result
+            # 步骤 2: read_down → 结构化结果（Markdown + 元数据）
             rd_result = _call_readdown(
                 html=raw["html"],
                 url=url,
                 debug=bool(kwargs.get("debug")),
             )
 
-            # Merge: carry over CDP metadata, overwrite with read_down fields
+            # 合并：CDP 标题作 fallback，read_down 字段优先
             merged = {
                 "url": url,
                 "text": rd_result.get("text", ""),
@@ -310,18 +378,18 @@ class CDPExtractProvider(WebSearchProvider):
                 "lang": rd_result.get("lang"),
                 "error": rd_result.get("error"),
             }
-            # Strip None values for optional fields (matches PageExtractionResult)
+            # 去掉 None 值（匹配 PageExtractionResult 可选字段语义）
             merged = {k: v for k, v in merged.items() if v is not None}
             results.append(merged)
 
         ok = sum(1 for r in results if r.get("error") is None)
-        logger.info("CDP extract: %d/%d succeeded", ok, len(results))
+        logger.info("CDP extract: %d/%d 成功", ok, len(results))
         return results
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
             "name": "CDP Extract (Chrome DevTools + Readability + Turndown)",
             "badge": "local · no key",
-            "tag": "Full pipeline: Chrome DevTools (port 9222) → Readability → Turndown Markdown",
+            "tag": "Chrome DevTools (port 9222) → Readability → Turndown Markdown",
             "env_vars": [],
         }
