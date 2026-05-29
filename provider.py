@@ -150,65 +150,98 @@ async def _cdp_send(ws, method: str, params: dict | None = None, msg_id: int = 1
 
 
 async def _scroll_to_bottom(ws, msg_id: int) -> int | None:
-    """通过 Runtime.evaluate 分步滚动到底部。
+    """分步滚动到底部，Python 控制节奏 + JS 检测底部。
 
-    不使用 awaitPromise+IIFE 的单命令方式，而是 Python 循环控制：
-    每步一个 Runtime.evaluate（window.scrollTo），中间 asyncio.sleep 控制间隔。
-    这样每一步的 CDP 响应都能独立确认，不会被 Promise reject 吞掉。
+    Runtime.evaluate 的 awaitPromise 只处理 microtask 队列（Promise.then），
+    不 pump macrotask（setTimeout），所以 JS 内 async/await + setTimeout
+    会在 CDP awaitPromise 上下文中死锁。
+
+    方案：
+      - 每步 JS 纯同步：window.scrollTo() 同步执行
+      - Python asyncio.sleep(0.05) 控制 50ms 间隔
+      - 每步后检查 window.scrollY + innerHeight >= scrollHeight 判断是否到底
+      - 到底后等待懒加载，高度增长则继续滚
 
     文档:
       - Runtime.evaluate: https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-evaluate
       - window.scrollTo: https://developer.mozilla.org/en-US/docs/Web/API/Window/scrollTo
+      - window.scrollY: https://developer.mozilla.org/en-US/docs/Web/API/Window/scrollY
       - Document.scrollingElement: https://developer.mozilla.org/en-US/docs/Web/API/Document/scrollingElement
     """
-    # 第一步：获取页面实际可滚动高度
-    # 使用 document.scrollingElement.scrollHeight 而非 document.body.scrollHeight
-    # 因为现代网页（标准模式）的滚动容器是 <html> 而非 <body>。
-    # 参考: https://developer.mozilla.org/en-US/docs/Web/API/Document/scrollingElement
-    get_height_js = "document.scrollingElement ? document.scrollingElement.scrollHeight : document.body.scrollHeight"
+    # 1) 获取页面实际可滚动高度
+    get_h = "document.scrollingElement ? document.scrollingElement.scrollHeight : document.body.scrollHeight"
     resp = await _cdp_send(ws, "Runtime.evaluate",
-                           {"expression": get_height_js, "returnByValue": True},
+                           {"expression": get_h, "returnByValue": True},
                            msg_id=msg_id)
     msg_id += 1
     if "error" in resp:
         logger.warning("获取页面高度失败: %s", resp["error"])
         return None
-
     total = resp.get("result", {}).get("result", {}).get("value", 0)
     if not isinstance(total, (int, float)) or total <= 0:
         logger.warning("无效页面高度: %s", total)
         return None
 
     total = int(total)
-    steps = 15
-    step = max(total // steps, 80)
-    logger.info("开始滚动: 总高度=%d, 步长=%d", total, step)
+    steps = max(total // 80, 1)  # 步长 ~80px
+    logger.info("开始滚动: 高度=%d, 步数=%d, 间隔=50ms", total, steps)
 
-    # 分步滚动，每步 Python 层面等待 200ms
-    for y in range(0, total + 1, step):
-        scroll_js = f"window.scrollTo(0, {y})"
-        resp = await _cdp_send(ws, "Runtime.evaluate",
-                               {"expression": scroll_js},
-                               msg_id=msg_id)
+    # 2) 分步滚动 + 底部检测
+    at_bottom = False
+    for y in range(0, total + 1, total // steps):
+        # 滚动到指定位置（纯同步，无 Promise）
+        await _cdp_send(ws, "Runtime.evaluate",
+                        {"expression": f"window.scrollTo(0, {y})"},
+                        msg_id=msg_id)
         msg_id += 1
-        if "error" in resp:
-            logger.warning("滚动到 %d 失败: %s", y, resp["error"])
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.05)  # 50ms 间隔
 
-    # 到底后等待 3 秒，触发懒加载
-    logger.info("已滚到底部，等待 3 秒让懒加载内容渲染...")
+        # 每 5 步检测一次是否到底
+        if y % (total // max(steps // 5, 1)) == 0 or y >= total:
+            check = await _cdp_send(ws, "Runtime.evaluate",
+                                    {"expression":
+                                     "window.scrollY + window.innerHeight >= "
+                                     "document.scrollingElement.scrollHeight",
+                                     "returnByValue": True},
+                                    msg_id=msg_id)
+            msg_id += 1
+            if check.get("result", {}).get("result", {}).get("value"):
+                at_bottom = True
+                break
+
+    # 如果循环结束还没检测到底，强行滚到底
+    if not at_bottom:
+        await _cdp_send(ws, "Runtime.evaluate",
+                        {"expression": "window.scrollTo(0, document.scrollingElement.scrollHeight)"},
+                        msg_id=msg_id)
+        msg_id += 1
+        await asyncio.sleep(0.05)
+        at_bottom = True
+
+    # 3) 到底后等待 3 秒触发懒加载
+    logger.info("到底, 等待 3s 懒加载...")
     await asyncio.sleep(3)
 
-    # 返回最终高度
+    # 4) 检查高度是否增长，增长则继续滚
     resp = await _cdp_send(ws, "Runtime.evaluate",
-                           {"expression": get_height_js, "returnByValue": True},
+                           {"expression": get_h, "returnByValue": True},
                            msg_id=msg_id)
     msg_id += 1
-    if "error" not in resp:
-        h = resp.get("result", {}).get("result", {}).get("value")
-        logger.info("滚动完成，最终高度=%s", h)
-        return h
-    return total
+    new_total = resp.get("result", {}).get("result", {}).get("value", total)
+    new_total = int(new_total)
+
+    if new_total > total:
+        logger.info("高度增长 %d→%d, 继续滚动", total, new_total)
+        for y in range(total, new_total + 1, max((new_total - total) // 10, 80)):
+            await _cdp_send(ws, "Runtime.evaluate",
+                            {"expression": f"window.scrollTo(0, {y})"},
+                            msg_id=msg_id)
+            msg_id += 1
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(2)
+
+    logger.info("滚动完成, 最终高度=%d", new_total)
+    return new_total
 
 
 async def _fetch_raw_html(url: str) -> Dict[str, Any]:
