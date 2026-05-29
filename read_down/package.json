@@ -1,0 +1,13 @@
+{
+  "name": "read-down",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Readability + Turndown pipeline: raw HTML → Markdown + metadata",
+  "main": "index.js",
+  "dependencies": {
+    "@mozilla/readability": "^0.5.0",
+    "jsdom": "^25.0.0",
+    "turndown": "^7.2.0",
+    "turndown-plugin-gfm": "^1.0.2"
+  }
+}
