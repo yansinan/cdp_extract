@@ -124,7 +124,7 @@ async def _cdp_send(ws, method: str, params: dict | None = None, msg_id: int = 1
 
 
 async def _fetch_raw_html(url: str) -> Dict[str, Any]:
-    """Open page via CDP, wait for load, return raw HTML."""
+    """Open page via CDP → load → scroll to bottom → grab HTML."""
     result: Dict[str, Any] = {"url": url, "html": "", "title": "", "error": None}
     browser_ws = _get_browser_ws_url()
     target_id, target_ws = await _create_target(browser_ws)
@@ -132,6 +132,7 @@ async def _fetch_raw_html(url: str) -> Dict[str, Any]:
 
     try:
         async with websockets.connect(target_ws, max_size=None) as ws:
+            # Step 1: Navigate + wait for frame to load
             await _cdp_send(ws, "Page.enable", msg_id=msg_id)
             msg_id += 1
 
@@ -140,6 +141,49 @@ async def _fetch_raw_html(url: str) -> Dict[str, Any]:
             if "error" in nav_resp:
                 raise RuntimeError(f"Page.navigate error: {nav_resp['error']}")
 
+            # Wait for frame to finish loading by reading events
+            # (Page.frameStoppedLoading is pushed, not command-based)
+            for _ in range(30):  # max 30s
+                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                msg = json.loads(raw)
+                if msg.get("method") == "Page.frameStoppedLoading":
+                    break
+                # Page.frameStartedLoading, Page.frameNavigated, etc. — skip
+                logger.debug("CDP load event: %s", msg.get("method"))
+
+            # Step 2: Scroll to bottom — 200ms intervals
+            scroll_script = """
+                (async () => {
+                    const delay = ms => new Promise(r => setTimeout(r, ms));
+                    const total = document.body.scrollHeight;
+                    const step = Math.max(Math.floor(total / 15), 80);
+                    for (let y = 0; y <= total; y += step) {
+                        window.scrollTo(0, y);
+                        await delay(200);
+                    }
+                    // Step 3: Wait 3 seconds at bottom
+                    await delay(3000);
+                    return document.body.scrollHeight;
+                })()
+            """
+            await ws.send(json.dumps({
+                "id": msg_id,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": scroll_script,
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                },
+            }))
+            msg_id += 1
+            scroll_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+            if "error" in scroll_resp:
+                logger.warning("Scroll eval error: %s", scroll_resp["error"])
+            else:
+                h = scroll_resp.get("result", {}).get("result", {}).get("value", "?")
+                logger.info("CDP scroll done, height=%s", h)
+
+            # Step 4: Grab HTML
             title_resp = await _cdp_send(
                 ws, "Runtime.evaluate",
                 {"expression": "document.title"},
@@ -156,7 +200,6 @@ async def _fetch_raw_html(url: str) -> Dict[str, Any]:
             )
             if "error" in html_resp:
                 raise RuntimeError(f"Runtime.evaluate error: {html_resp['error']}")
-
             result["html"] = html_resp["result"]["result"].get("value", "")
 
     except Exception as exc:
