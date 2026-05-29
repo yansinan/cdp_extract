@@ -124,7 +124,12 @@ async def _cdp_send(ws, method: str, params: dict | None = None, msg_id: int = 1
 
 
 async def _fetch_raw_html(url: str) -> Dict[str, Any]:
-    """Open page via CDP → load → scroll to bottom → grab HTML."""
+    """Open page via CDP → load → scroll to bottom → grab HTML.
+
+    Page load detection uses lifecycleEvent('load') via CDP
+    Page.setLifecycleEventsEnabled — fires when window.onload
+    completes (all resources including images/scripts).
+    """
     result: Dict[str, Any] = {"url": url, "html": "", "title": "", "error": None}
     browser_ws = _get_browser_ws_url()
     target_id, target_ws = await _create_target(browser_ws)
@@ -132,24 +137,41 @@ async def _fetch_raw_html(url: str) -> Dict[str, Any]:
 
     try:
         async with websockets.connect(target_ws, max_size=None) as ws:
-            # Step 1: Navigate + wait for frame to load
             await _cdp_send(ws, "Page.enable", msg_id=msg_id)
             msg_id += 1
 
-            nav_resp = await _cdp_send(ws, "Page.navigate", {"url": url}, msg_id=msg_id)
+            # Enable lifecycle events (needed for load detection)
+            await _cdp_send(ws, "Page.setLifecycleEventsEnabled", {"enabled": True}, msg_id=msg_id)
             msg_id += 1
-            if "error" in nav_resp:
-                raise RuntimeError(f"Page.navigate error: {nav_resp['error']}")
 
-            # Wait for frame to finish loading by reading events
-            # (Page.frameStoppedLoading is pushed, not command-based)
-            for _ in range(30):  # max 30s
-                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            # Navigate — manually send then read events until load completes
+            await ws.send(json.dumps({
+                "id": msg_id,
+                "method": "Page.navigate",
+                "params": {"url": url},
+            }))
+            navigate_responded = False
+            load_fired = False
+
+            while not (navigate_responded and load_fired):
+                raw = await asyncio.wait_for(ws.recv(), timeout=30)
                 msg = json.loads(raw)
-                if msg.get("method") == "Page.frameStoppedLoading":
-                    break
-                # Page.frameStartedLoading, Page.frameNavigated, etc. — skip
-                logger.debug("CDP load event: %s", msg.get("method"))
+                mid = msg.get("id")
+                method = msg.get("method")
+
+                if mid == msg_id:
+                    navigate_responded = True
+                    if "error" in msg:
+                        raise RuntimeError(f"Page.navigate error: {msg['error']}")
+                elif method == "Page.lifecycleEvent":
+                    evt_name = msg.get("params", {}).get("name", "")
+                    if evt_name == "load":
+                        load_fired = True
+                        logger.debug("CDP lifecycle: load fired")
+                else:
+                    logger.debug("CDP nav event: %s", method or mid)
+
+            msg_id += 1  # consume the navigate msg_id
 
             # Step 2: Scroll to bottom — 200ms intervals
             scroll_script = """
