@@ -41,17 +41,23 @@ try:
                 for key, var in mapping.items():
                     val = cdp_cfg.get(key)
                     if val is not None and val != '':
-                        print(f'{var}={shlex.quote(str(val))}')
+                        # shlex.quote 在 bash heredoc 中有嵌套引号问题，
+                        # 直接用 printf %q 让 bash 处理转义
+                        print(f'{var}', end='=')
+                        print(repr(str(val)))
                 break
 except Exception:
     pass
 "
   local output
-  output=$(python3 -c "$cfg_py" 2>/dev/null) || return 1
-  if [ -n "$output" ]; then
-    eval "$output"
-    _LOADED_CONFIG=true
-  fi
+  # 优先使用 Hermes venv 的 python（有 yaml 包）
+  for _py in "${HERMES_PY:-}" "$HOME/.hermes/hermes-agent/venv/bin/python3" "/usr/bin/python3" "python3"; do
+    [ -x "$_py" ] || continue
+    output=$("$_py" -c "$cfg_py" 2>/dev/null) && break
+  done
+  [ -n "$output" ] || return 1
+  eval "$output"
+  _LOADED_CONFIG=true
 }
 
 # 对环境变量设默认值：优先已设的 env var，其次 config.yaml 读取，最后硬编码默认
