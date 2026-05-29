@@ -1,7 +1,9 @@
-"""CDP web extract plugin — user plugin for testing web_extract provider override.
+"""CDP web extract plugin — Hermes Agent 的 web_extract provider。
 
-Minimal implementation that fetches URLs via requests and extracts readable text.
-Uses html.parser / lxml for content extraction — no external SDK required.
+通过 Chrome DevTools Protocol (CDP) 打开网页、滚动到底触发懒加载，
+获取完整 HTML，再经 Readability + Turndown 管道输出结构化 Markdown。
+
+输出接口对齐 hermes-sidebar 的 PageExtractionResult。
 """
 
 from __future__ import annotations

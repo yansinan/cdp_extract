@@ -1,6 +1,6 @@
 name: web-cdp-extract
-version: 0.1.0
-description: "CDP-based web content extraction — HTTP fetch + text extract via requests"
+version: 1.0.0
+description: "CDP-based web content extraction: Chrome DevTools → Readability → Turndown Markdown"
 author: dr
 kind: backend
 provides_web_providers:
