@@ -6,7 +6,66 @@ set -euo pipefail
 # 所有配置支持通过同名环境变量覆盖（大写，下划线分隔）。
 # Usage: $0 {start|stop|restart|status}
 
-# --- 配置（环境变量覆盖，大写+下划线） ---
+# --- 配置（环境变量覆盖，大写+下划线）---
+# 所有变量优先读环境变量，未设时自动从 config.yaml 加载
+
+# 先尝试从 hermes config.yaml 自举加载配置
+_LOADED_CONFIG=false
+_load_from_hermes_config() {
+  # 用 python 从 config.yaml 提取 cdp_extract 配置并导出为环境变量
+  local cfg_py="
+import os, yaml, shlex
+try:
+    paths = [os.getenv('HERMES_HOME', os.path.expanduser('~/.hermes')) + '/config.yaml',
+             os.path.expanduser('~/.hermes/config.yaml')]
+    for p in paths:
+        if os.path.isfile(p):
+            with open(p) as f:
+                cfg = yaml.safe_load(f)
+            cdp_cfg = cfg.get('plugins', {}).get('cdp_extract', {})
+            if cdp_cfg:
+                mapping = {
+                    'remote_host': 'CDP_TUNNEL_REMOTE_HOST',
+                    'remote_user': 'CDP_TUNNEL_REMOTE_USER',
+                    'ssh_key': 'CDP_TUNNEL_SSH_KEY',
+                    'remote_port': 'CDP_TUNNEL_REMOTE_PORT',
+                    'local_port': 'CDP_TUNNEL_LOCAL_PORT',
+                    'remote_debug_port': 'CDP_TUNNEL_REMOTE_DEBUG_PORT',
+                    'tunnel_tool': 'CDP_TUNNEL_TOOL',
+                    'remote_chrome_bin': 'CDP_TUNNEL_REMOTE_CHROME_BIN',
+                    'remote_chrome_profile': 'CDP_TUNNEL_REMOTE_CHROME_PROFILE',
+                    'remote_chrome_args': 'CDP_TUNNEL_REMOTE_CHROME_ARGS',
+                    'agent_browser_bin': 'CDP_TUNNEL_AGENT_BROWSER_BIN',
+                    'hermes_py': 'CDP_TUNNEL_HERMES_PY',
+                }
+                for key, var in mapping.items():
+                    val = cdp_cfg.get(key)
+                    if val is not None and val != '':
+                        print(f'{var}={shlex.quote(str(val))}')
+                break
+except Exception:
+    pass
+"
+  local output
+  output=$(python3 -c "$cfg_py" 2>/dev/null) || return 1
+  if [ -n "$output" ]; then
+    eval "$output"
+    _LOADED_CONFIG=true
+  fi
+}
+
+# 对环境变量设默认值：优先已设的 env var，其次 config.yaml 读取，最后硬编码默认
+_init_var() {
+  local var_name="$1"
+  local default_val="$2"
+  if [ -z "${!var_name:-}" ]; then
+    export "$var_name=$default_val"
+  fi
+}
+
+# 尝试从 hermes config.yaml 加载配置（仅环境变量未设时生效）
+_load_from_hermes_config
+
 REMOTE_USER="${CDP_TUNNEL_REMOTE_USER:-sunny}"
 REMOTE_HOST="${CDP_TUNNEL_REMOTE_HOST:-192.168.1.35}"
 SSH_KEY="${CDP_TUNNEL_SSH_KEY:-}"  # optional: path to private key
