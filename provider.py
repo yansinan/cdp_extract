@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 CDP_URL = "http://127.0.0.1:9222"
 PAGE_TIMEOUT = 30  # 单次 CDP 命令超时
+TUNNEL_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "scripts", "cdp_tunnel.sh",
+)
 READ_DOWN_INDEX = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "read_down", "index.js",
@@ -33,8 +37,97 @@ READ_DOWN_INDEX = os.path.join(
 
 
 # ---------------------------------------------------------------------------
-# read_down 桥接层
+# CDP 连接管理
 # ---------------------------------------------------------------------------
+
+
+def _load_cdp_config() -> dict:
+    """从 config.yaml 读取 plugins.cdp_extract 配置。"""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        return cfg.get("plugins", {}).get("cdp_extract", {}) or {}
+    except Exception:
+        return {}
+
+
+def _cdp_url_from_config() -> str:
+    """返回实际的 CDP URL（可配置）。"""
+    cfg = _load_cdp_config()
+    return cfg.get("cdp_url", CDP_URL)
+
+
+def _build_tunnel_env(cfg: dict) -> dict:
+    """根据配置构造隧道脚本的环境变量。"""
+    env = {}
+    mapping = {
+        "remote_host": "CDP_TUNNEL_REMOTE_HOST",
+        "remote_user": "CDP_TUNNEL_REMOTE_USER",
+        "ssh_key": "CDP_TUNNEL_SSH_KEY",
+        "remote_port": "CDP_TUNNEL_REMOTE_PORT",
+        "local_port": "CDP_TUNNEL_LOCAL_PORT",
+        "remote_debug_port": "CDP_TUNNEL_REMOTE_DEBUG_PORT",
+        "tunnel_tool": "CDP_TUNNEL_TOOL",
+        "remote_chrome_bin": "CDP_TUNNEL_REMOTE_CHROME_BIN",
+        "remote_chrome_profile": "CDP_TUNNEL_REMOTE_CHROME_PROFILE",
+        "remote_chrome_args": "CDP_TUNNEL_REMOTE_CHROME_ARGS",
+    }
+    for key, var in mapping.items():
+        val = cfg.get(key)
+        if val is not None and val != "":
+            env[var] = str(val)
+    return env
+
+
+def _check_local_cdp(cdp_url: str = CDP_URL) -> bool:
+    """检查本地 CDP 端口是否可达。"""
+    try:
+        resp = requests.get(f"{cdp_url}/json/version", timeout=3)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _ensure_cdp() -> bool:
+    """确保 CDP 可用。先检查本地，失败则尝试隧道。
+
+    隧道配置在 config.yaml > plugins > cdp_extract 中。
+    如果设了 remote_host，则调用 cdp_tunnel.sh start 建立隧道。
+    """
+    global CDP_URL
+    CDP_URL = _cdp_url_from_config()
+
+    if _check_local_cdp(CDP_URL):
+        return True
+
+    cfg = _load_cdp_config()
+    if not cfg.get("remote_host"):
+        return False
+
+    logger.info("本地 CDP 不可用，尝试远程隧道 %s@%s",
+                cfg.get("remote_user"), cfg.get("remote_host"))
+
+    if not os.path.isfile(TUNNEL_SCRIPT):
+        logger.warning("隧道脚本不存在: %s", TUNNEL_SCRIPT)
+        return False
+
+    env = os.environ.copy()
+    env.update(_build_tunnel_env(cfg))
+
+    try:
+        proc = subprocess.run(
+            [TUNNEL_SCRIPT, "start"],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+        logger.info("隧道脚本返回: %s", proc.stdout.strip()[:200])
+        if proc.returncode != 0:
+            logger.warning("隧道启动失败: %s", proc.stderr.strip()[:200])
+            return False
+    except Exception as exc:
+        logger.warning("隧道调用失败: %s", exc)
+        return False
+
+    return _check_local_cdp(CDP_URL)
 
 
 def _call_readdown(html: str, url: str = "", debug: bool = False) -> Dict[str, Any]:
@@ -338,15 +431,15 @@ class CDPExtractProvider(WebSearchProvider):
         return "CDP Extract (Chrome DevTools + Readability + Turndown)"
 
     def is_available(self) -> bool:
-        """检查本地 CDP (port 9222) 和 Node.js 是否可用"""
+        """检查本地 CDP (port 9222) 和 Node.js 是否可用。
+        
+        本地不可用时，如果配置了 remote_host，自动尝试远程隧道。
+        """
         try:
-            resp = requests.get(f"{CDP_URL}/json/version", timeout=3)
-            if resp.status_code != 200:
-                return False
             subprocess.run(["node", "--version"], capture_output=True, timeout=5)
-            return True
         except Exception:
             return False
+        return _ensure_cdp()
 
     def supports_search(self) -> bool:
         return False
@@ -358,6 +451,16 @@ class CDPExtractProvider(WebSearchProvider):
         """对每个 URL: CDP 抓取 → read_down 提取 → 返回结构化结果"""
         logger.info("CDP extract: %d URL(s)", len(urls))
         results: List[Dict[str, Any]] = []
+
+        # 确保 CDP 可用（本地或隧道）
+        if not _ensure_cdp():
+            logger.warning("CDP 不可用，无法提取")
+            for url in urls:
+                results.append({
+                    "url": url, "text": "", "markdown": None,
+                    "error": "CDP 不可用（本地 9222 或远程隧道均不可达）",
+                })
+            return results
 
         for url in urls:
             logger.info("CDP extract: fetching %s", url)

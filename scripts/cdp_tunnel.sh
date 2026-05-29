@@ -2,27 +2,28 @@
 set -euo pipefail
 
 # start_remote_browser_tunnel.sh
+# 也可以作为 cdp_extract 插件的隧道管理脚本被调用。
+# 所有配置支持通过同名环境变量覆盖（大写，下划线分隔）。
 # Usage: $0 {start|stop|restart|status}
-# Behaviors:
-# - status: check local 127.0.0.1:9222 (via curl) and report tunnel+remote-browser state; when local CDP is reachable, also print `hermes browser status`
-# - start: ensure remote has Chrome CDP; if not, start remote Chrome; then establish local ssh/autossh tunnel, write /tmp/openclaw_tunnel.pid, and when local CDP is reachable also print `hermes browser connect` + `hermes browser status`
-# - stop: kill local tunnel (pidfile) and optionally remote chrome if started by this script (remote pidfile /tmp/openclaw_chrome.pid)
-# - restart: stop then start
 
-REMOTE_USER="sunny"
-REMOTE_HOST="192.168.1.35"
-SSH_KEY=""  # optional: path to private key
-REMOTE_CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-REMOTE_PIDFILE="/tmp/openclaw_chrome.pid"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCAL_TUNNEL_PIDFILE="${SCRIPT_DIR}/openclaw_tunnel.pid"
-LOCAL_FORWARD_PORT=9222
-REMOTE_DEBUG_PORT=9222
-AUTOSSH_CMD="autossh"
-SSH_CMD="ssh"
-CURL_CMD="curl"
-# HERMES_BIN="${HERMES_BIN:-${HERMES_HOME}/hermes-agent/venv/bin/hermes}"
-HERMES_PY="${HERMES_PY:-${HERMES_HOME}/hermes-agent/venv/bin/python}"
+# --- 配置（环境变量覆盖，大写+下划线） ---
+REMOTE_USER="${CDP_TUNNEL_REMOTE_USER:-sunny}"
+REMOTE_HOST="${CDP_TUNNEL_REMOTE_HOST:-192.168.1.35}"
+SSH_KEY="${CDP_TUNNEL_SSH_KEY:-}"  # optional: path to private key
+REMOTE_SSH_PORT="${CDP_TUNNEL_REMOTE_PORT:-22}"
+REMOTE_CHROME_BIN="${CDP_TUNNEL_REMOTE_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+REMOTE_CHROME_PROFILE="${CDP_TUNNEL_REMOTE_CHROME_PROFILE:-/tmp/chrome-cdp-profile}"
+REMOTE_CHROME_ARGS="${CDP_TUNNEL_REMOTE_CHROME_ARGS:---no-first-run}"
+REMOTE_PIDFILE="${CDP_TUNNEL_REMOTE_PIDFILE:-/tmp/openclaw_chrome.pid}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" 2>/dev/null || echo ".")" && pwd)"
+LOCAL_TUNNEL_PIDFILE="${CDP_TUNNEL_LOCAL_PIDFILE:-${SCRIPT_DIR}/openclaw_tunnel.pid}"
+LOCAL_FORWARD_PORT="${CDP_TUNNEL_LOCAL_PORT:-9222}"
+REMOTE_DEBUG_PORT="${CDP_TUNNEL_REMOTE_DEBUG_PORT:-9222}"
+TUNNEL_TOOL="${CDP_TUNNEL_TOOL:-auto}"  # auto | autossh | ssh
+AUTOSSH_CMD="${CDP_TUNNEL_AUTOSSH_CMD:-autossh}"
+SSH_CMD="${CDP_TUNNEL_SSH_CMD:-ssh}"
+CURL_CMD="${CDP_TUNNEL_CURL_CMD:-curl}"
+CONNECT_TIMEOUT="${CDP_TUNNEL_CONNECT_TIMEOUT:-5}"
 
 SSH_KEY_ARG=()
 if [ -n "${SSH_KEY}" ] && [ -f "${SSH_KEY}" ]; then

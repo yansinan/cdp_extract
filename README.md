@@ -60,6 +60,38 @@ Hermes Agent 的 `web_extract` provider。通过本地 Chrome DevTools Protocol 
 | `lang` | `string?` | 语言 |
 | `error` | `string?` | 错误信息 |
 
+## 配置
+
+在 `config.yaml` 的 `plugins.cdp_extract` 中配置：
+
+```yaml
+plugins:
+  enabled:
+    - web/cdp_extract
+  cdp_extract:
+    # CDP 端点（默认 http://127.0.0.1:9222）
+    cdp_url: "http://127.0.0.1:9222"
+
+    # --- 远端隧道（可选）---
+    # 设了 remote_host 后, 本地 CDP 不可用时自动建隧道
+    remote_host: "192.168.1.35"
+    remote_user: "sunny"
+    remote_port: 22
+    ssh_key: ""
+
+    # 端口转发
+    local_port: 9222
+    remote_debug_port: 9222
+    tunnel_tool: auto         # auto | autossh | ssh
+
+    # 远端 Chrome 启动
+    remote_chrome_bin: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    remote_chrome_profile: "/tmp/chrome-cdp-profile"
+    remote_chrome_args: "--no-first-run"
+
+  disabled: []
+```
+
 ## 使用
 
 ### 作为 Hermes Plugin
