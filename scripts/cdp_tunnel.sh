@@ -24,6 +24,7 @@ AUTOSSH_CMD="${CDP_TUNNEL_AUTOSSH_CMD:-autossh}"
 SSH_CMD="${CDP_TUNNEL_SSH_CMD:-ssh}"
 CURL_CMD="${CDP_TUNNEL_CURL_CMD:-curl}"
 CONNECT_TIMEOUT="${CDP_TUNNEL_CONNECT_TIMEOUT:-5}"
+HERMES_PY="${CDP_TUNNEL_HERMES_PY:-}"
 
 SSH_KEY_ARG=()
 if [ -n "${SSH_KEY}" ] && [ -f "${SSH_KEY}" ]; then
@@ -31,7 +32,7 @@ if [ -n "${SSH_KEY}" ] && [ -f "${SSH_KEY}" ]; then
 fi
 
 check_local_cdp() {
-  if [ -x "$HERMES_PY" ]; then
+  if [ -n "${HERMES_PY}" ] && [ -x "${HERMES_PY}" ]; then
     if "$HERMES_PY" - <<PY >/dev/null 2>&1
 import urllib.request
 urllib.request.urlopen("http://127.0.0.1:${LOCAL_FORWARD_PORT}/json/version", timeout=3).read(1)

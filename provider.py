@@ -72,6 +72,7 @@ def _build_tunnel_env(cfg: dict) -> dict:
         "remote_chrome_profile": "CDP_TUNNEL_REMOTE_CHROME_PROFILE",
         "remote_chrome_args": "CDP_TUNNEL_REMOTE_CHROME_ARGS",
         "agent_browser_bin": "CDP_TUNNEL_AGENT_BROWSER_BIN",
+        "hermes_py": "CDP_TUNNEL_HERMES_PY",
     }
     for key, var in mapping.items():
         val = cfg.get(key)
