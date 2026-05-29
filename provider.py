@@ -1,125 +1,140 @@
-"""CDP web extract provider — HTTP fetch + text extraction.
+"""CDP web extract provider — Phase 1: fetch full HTML via Chrome CDP on port 9222.
 
-Basic implementation: fetches URLs via requests, extracts readable text
-from HTML using Python's built-in HTMLParser. No external SDK required.
-
-Extend later with proper Readability / trafilatura extraction.
+Connects to local Chrome DevTools Protocol, opens a tab, navigates to URL,
+waits for page load, returns full HTML text.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from html.parser import HTMLParser
 from typing import Any, Dict, List
-from urllib.parse import urlparse
+
+import requests
+import websockets
 
 from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Minimal HTML → text extractor (no external deps)
-# ---------------------------------------------------------------------------
+CDP_URL = "http://127.0.0.1:9222"
+PAGE_TIMEOUT = 30
 
 
-class _TextExtractor(HTMLParser):
-    """Strips HTML tags, extracts visible text with paragraph spacing."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._text: List[str] = []
-        self._skip = False
-
-    def handle_starttag(self, tag: str, attrs: List[tuple]) -> None:
-        tag_lower = tag.lower()
-        if tag_lower in {"script", "style", "noscript"}:
-            self._skip = True
-        if tag_lower in {"p", "br", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li"}:
-            self._text.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() in {"script", "style", "noscript"}:
-            self._skip = False
-
-    def handle_data(self, data: str) -> None:
-        if not self._skip:
-            stripped = data.strip()
-            if stripped:
-                self._text.append(stripped)
-
-    def get_text(self) -> str:
-        return " ".join(self._text).strip()
+def _get_browser_ws_url() -> str:
+    """Get the browser-level WebSocket debugger URL from CDP."""
+    resp = requests.get(f"{CDP_URL}/json/version", timeout=5)
+    resp.raise_for_status()
+    return resp.json()["webSocketDebuggerUrl"]
 
 
-def _extract_text(html: str) -> str:
-    """Extract readable text from raw HTML."""
-    parser = _TextExtractor()
-    parser.feed(html)
-    return parser.get_text()
+async def _create_target(browser_ws: str) -> tuple[str, str]:
+    """Create a new page target, return (target_id, target_ws_url)."""
+    async with websockets.connect(browser_ws, max_size=None) as ws:
+        msg = {"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}
+        await ws.send(json.dumps(msg))
+        resp = await asyncio.wait_for(ws.recv(), timeout=10)
+        result = json.loads(resp)
+        if "error" in result:
+            raise RuntimeError(f"CDP Target.createTarget error: {result['error']}")
+        target_id = result["result"]["targetId"]
+
+    # Get target's websocket URL from REST endpoint
+    targets_resp = requests.get(f"{CDP_URL}/json", timeout=5)
+    for t in targets_resp.json():
+        if t["id"] == target_id:
+            return target_id, t["webSocketDebuggerUrl"]
+
+    raise RuntimeError(f"Target {target_id} not found in /json list")
 
 
-def _fetch_url(url: str, timeout: int = 15) -> Dict[str, Any]:
-    """Fetch a single URL and return extracted content."""
-    import requests
+def _close_target(target_id: str) -> None:
+    """Close a CDP target."""
+    try:
+        requests.get(f"{CDP_URL}/json/close/{target_id}", timeout=5)
+    except Exception as exc:
+        logger.warning("Failed to close target %s: %s", target_id, exc)
 
+
+async def _cdp_send(ws, method: str, params: dict | None = None, msg_id: int = 1) -> dict:
+    """Send a CDP command and wait for the matching response.
+
+    CDP sends events (no ``id`` field) interleaved with responses.
+    We must skip events and only return the response whose ``id`` matches.
+    """
+    payload: dict[str, Any] = {"id": msg_id, "method": method}
+    if params:
+        payload["params"] = params
+    await ws.send(json.dumps(payload))
+    while True:
+        raw = await asyncio.wait_for(ws.recv(), timeout=PAGE_TIMEOUT)
+        msg = json.loads(raw)
+        # Events have "method" but no "id"; responses have matching "id"
+        if msg.get("id") == msg_id:
+            return msg
+        # Otherwise it's an event — log and skip
+        logger.debug("CDP event (skipped): %s", msg.get("method", msg))
+
+
+async def _fetch_single_via_cdp(url: str) -> Dict[str, Any]:
+    """Open page via CDP, wait for load, return full HTML."""
     result: Dict[str, Any] = {"url": url, "title": "", "content": "", "raw_content": ""}
+    browser_ws = _get_browser_ws_url()
+    target_id, target_ws = await _create_target(browser_ws)
+    msg_id = 1
 
     try:
-        resp = requests.get(
-            url,
-            timeout=timeout,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            },
-            allow_redirects=True,
-        )
-        resp.raise_for_status()
+        async with websockets.connect(target_ws, max_size=None) as ws:
+            # Enable Page events
+            await _cdp_send(ws, "Page.enable", msg_id=msg_id)
+            msg_id += 1
+
+            # Navigate — page loads automatically; CDP sends events
+            # (frameStartedNavigating, frameStoppedLoading) in between
+            # commands. No explicit wait needed — Runtime.evaluate below
+            # runs after the page settles.
+            nav_resp = await _cdp_send(ws, "Page.navigate", {"url": url}, msg_id=msg_id)
+            msg_id += 1
+            if "error" in nav_resp:
+                raise RuntimeError(f"Page.navigate error: {nav_resp['error']}")
+
+            # Get page title
+            title_resp = await _cdp_send(
+                ws, "Runtime.evaluate",
+                {"expression": "document.title"},
+                msg_id,
+            )
+            msg_id += 1
+            title = ""
+            if "result" in title_resp and "result" in title_resp["result"]:
+                title = title_resp["result"]["result"].get("value", "")
+
+            # Get full HTML
+            html_resp = await _cdp_send(
+                ws, "Runtime.evaluate",
+                {"expression": "document.documentElement.outerHTML", "returnByValue": True},
+                msg_id,
+            )
+            if "error" in html_resp:
+                raise RuntimeError(f"Runtime.evaluate error: {html_resp['error']}")
+
+            html = html_resp["result"]["result"].get("value", "")
+            result["title"] = title
+            result["content"] = html
+            result["raw_content"] = html
+
     except Exception as exc:
         logger.warning("CDP fetch failed for %s: %s", url, exc)
         result["error"] = str(exc)
-        return result
-
-    # Detect content type
-    ct = resp.headers.get("content-type", "").lower()
-    raw_text = resp.text
-    result["raw_content"] = raw_text
-
-    if "text/html" in ct or "text/plain" in ct:
-        # Try to extract title from HTML
-        title = ""
-        content = ""
-        if "text/html" in ct:
-            import re
-
-            m = re.search(r"<title[^>]*>(.*?)</title>", raw_text, re.IGNORECASE | re.DOTALL)
-            if m:
-                title = m.group(1).strip()
-            content = _extract_text(raw_text)
-        else:
-            content = raw_text
-
-        result["title"] = title
-        result["content"] = content
-    else:
-        # Non-HTML — just note the content type
-        result["title"] = url
-        result["content"] = f"[Content-Type: {ct}] {raw_text[:200]}"
+    finally:
+        _close_target(target_id)
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# Provider
-# ---------------------------------------------------------------------------
-
-
 class CDPExtractProvider(WebSearchProvider):
-    """CDP-based web content extractor — fetch + text extraction via requests."""
+    """CDP-based web content extractor — Phase 1: full HTML via Chrome DevTools."""
 
     @property
     def name(self) -> str:
@@ -127,14 +142,14 @@ class CDPExtractProvider(WebSearchProvider):
 
     @property
     def display_name(self) -> str:
-        return "CDP Extract (requests)"
+        return "CDP Extract (Chrome DevTools)"
 
     def is_available(self) -> bool:
-        """Always available — requests is a Hermes core dependency."""
+        """Return True when local CDP port 9222 is reachable."""
         try:
-            import requests  # noqa: F401
-            return True
-        except ImportError:
+            resp = requests.get(f"{CDP_URL}/json/version", timeout=3)
+            return resp.status_code == 200
+        except Exception:
             return False
 
     def supports_search(self) -> bool:
@@ -143,31 +158,35 @@ class CDPExtractProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
-        """Fetch and extract content from one or more URLs.
+    async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
+        """Fetch full HTML of each URL via Chrome CDP.
 
         Args:
-            urls: URLs to extract.
-            kwargs: Optional ``timeout`` (int, seconds per URL).
+            urls: URLs to fetch.
+            kwargs: Unused (kept for forward compat).
 
         Returns:
-            List of per-URL result dicts.
+            List of per-URL result dicts with full HTML in ``content``.
         """
-        timeout = kwargs.get("timeout", 15)
+        logger.info("CDP extract: fetching %d URL(s) via Chrome DevTools", len(urls))
         results: List[Dict[str, Any]] = []
 
         for url in urls:
-            logger.info("CDP extract: fetching %s", url)
-            result = _fetch_url(url, timeout=int(timeout))
+            logger.info("CDP extract: navigating to %s", url)
+            result = await _fetch_single_via_cdp(url)
             results.append(result)
 
-        logger.info("CDP extract: %d URLs processed", len(results))
+        logger.info(
+            "CDP extract: %d URLs processed, %d succeeded",
+            len(results),
+            sum(1 for r in results if "error" not in r),
+        )
         return results
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
-            "name": "CDP Extract (requests)",
-            "badge": "test · no key",
-            "tag": "Basic HTTP fetch + HTML text extraction via requests — no API key needed",
+            "name": "CDP Extract (Chrome DevTools)",
+            "badge": "local · no key",
+            "tag": "Full HTML extraction via local Chrome DevTools (port 9222) — no API key needed",
             "env_vars": [],
         }
