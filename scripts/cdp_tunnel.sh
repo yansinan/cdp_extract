@@ -14,9 +14,9 @@ REMOTE_SSH_PORT="${CDP_TUNNEL_REMOTE_PORT:-22}"
 REMOTE_CHROME_BIN="${CDP_TUNNEL_REMOTE_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 REMOTE_CHROME_PROFILE="${CDP_TUNNEL_REMOTE_CHROME_PROFILE:-/tmp/chrome-cdp-profile}"
 REMOTE_CHROME_ARGS="${CDP_TUNNEL_REMOTE_CHROME_ARGS:---no-first-run}"
-REMOTE_PIDFILE="${CDP_TUNNEL_REMOTE_PIDFILE:-/tmp/openclaw_chrome.pid}"
+REMOTE_PIDFILE="${CDP_TUNNEL_REMOTE_PIDFILE:-/tmp/cdp_extract_chrome.pid}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" 2>/dev/null || echo ".")" && pwd)"
-LOCAL_TUNNEL_PIDFILE="${CDP_TUNNEL_LOCAL_PIDFILE:-${SCRIPT_DIR}/openclaw_tunnel.pid}"
+LOCAL_TUNNEL_PIDFILE="${CDP_TUNNEL_LOCAL_PIDFILE:-${SCRIPT_DIR}/.tunnel.pid}"
 LOCAL_FORWARD_PORT="${CDP_TUNNEL_LOCAL_PORT:-9222}"
 REMOTE_DEBUG_PORT="${CDP_TUNNEL_REMOTE_DEBUG_PORT:-9222}"
 TUNNEL_TOOL="${CDP_TUNNEL_TOOL:-auto}"  # auto | autossh | ssh
@@ -49,27 +49,27 @@ PY
 }
 
 check_remote_cdp() {
-  if ssh "${SSH_KEY_ARG[@]}" -o BatchMode=yes -o ConnectTimeout=5 "${REMOTE_USER}@${REMOTE_HOST}" "${CURL_CMD} -sS --max-time 3 http://127.0.0.1:${REMOTE_DEBUG_PORT}/json/version >/dev/null 2>&1 && echo OK || echo NO" 2>/dev/null | grep -q OK; then
+  if ssh "${SSH_KEY_ARG[@]}" -o BatchMode=yes -o ConnectTimeout="${CONNECT_TIMEOUT}" "${REMOTE_USER}@${REMOTE_HOST}" "${CURL_CMD} -sS --max-time 3 http://127.0.0.1:${REMOTE_DEBUG_PORT}/json/version >/dev/null 2>&1 && echo OK || echo NO" 2>/dev/null | grep -q OK; then
     return 0
   fi
   return 1
 }
 
-#/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir="/tmp/chrome-openclaw-profile" --no-first-run
-#   --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --no-default-browser-check
+# 远端 Chrome 启动脚本（通过 SSH 推送）
 start_remote_chrome() {
-  ssh "${SSH_KEY_ARG[@]}" -o BatchMode=yes "${REMOTE_USER}@${REMOTE_HOST}" bash -s <<EOF
+  ssh "${SSH_KEY_ARG[@]}" -o BatchMode=yes -o ConnectTimeout="${CONNECT_TIMEOUT}" "${REMOTE_USER}@${REMOTE_HOST}" bash -s <<EOF
 set -euo pipefail
 CHROME_BIN="${REMOTE_CHROME_BIN}"
 PIDFILE="${REMOTE_PIDFILE}"
-PROFILE="/tmp/chrome-openclaw-profile"
+PROFILE="${REMOTE_CHROME_PROFILE}"
+LOG="/tmp/cdp_extract_chrome.log"
 REMOTE_DEBUG_PORT=${REMOTE_DEBUG_PORT}
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" >/dev/null 2>&1; then
   echo "[start_remote_browser_tunnel]REMOTE_ALREADY_RUNNING"
   exit 0
 fi
 if [ -x "$CHROME_BIN" ]; then
-  nohup "$CHROME_BIN" --remote-debugging-port=$REMOTE_DEBUG_PORT --user-data-dir="$PROFILE" --no-first-run >/tmp/openclaw_chrome.log 2>&1 &
+  nohup "$CHROME_BIN" --remote-debugging-port=$REMOTE_DEBUG_PORT --user-data-dir="$PROFILE" $REMOTE_CHROME_ARGS >"$LOG" 2>&1 &
   echo $! > "$PIDFILE"
   sleep 2
   if curl -sS --max-time 3 "http://127.0.0.1:$REMOTE_DEBUG_PORT/json/version" >/dev/null 2>&1; then
@@ -146,12 +146,12 @@ stop_tunnel() {
 }
 
 ensure_agent_browser_connect() {
-  AGENT_BROWSER_BIN="${AGENT_BROWSER_BIN:-${HERMES_HOME}/hermes-agent/node_modules/.bin/agent-browser}"
-  CDP_PORT="${CDP_PORT:-9222}"
+  AGENT_BROWSER_BIN="${CDP_TUNNEL_AGENT_BROWSER_BIN:-}"
+  CDP_PORT="${CDP_TUNNEL_LOCAL_PORT:-9222}"
 
   print_err(){ echo "[start_remote_browser_tunnel]$@" >&2; }
 
-  if [ ! -x "$AGENT_BROWSER_BIN" ]; then
+  if [ -z "$AGENT_BROWSER_BIN" ] || [ ! -x "$AGENT_BROWSER_BIN" ]; then
     print_err "agent-browser binary not found or not executable: $AGENT_BROWSER_BIN"
     return 2
   fi
