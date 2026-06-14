@@ -92,42 +92,86 @@ def _check_local_cdp(cdp_url: str = CDP_URL) -> bool:
 
 
 def _try_hermes_local_chrome() -> bool:
-    """调 Hermes 内置 try_launch_chrome_debug() 启动本地 Chromium-family 浏览器。
+    """细粒度复用 Hermes 浏览器探测模块, 启动本地 Chromium-family 浏览器。
 
-    Profile 路径用 Hermes 标准的 ~/.hermes/chrome-debug (与 /browser connect 一致)。
-    进程用 start_new_session=True 脱离父进程 — 我们管不到 PID, 但也不需要管:
-    下次 _check_local_cdp() 会反映真实状态。
+    设计:
+      - 不调 Hermes 的 try_launch_chrome_debug() (黑盒, 写死 ~/.hermes/chrome-debug
+        + 不加 --ozone-platform=wayland → 在 Sway/Wayland-only 桌面会失败
+        + 同 user-data-dir 不能起两个实例, 单 instance lock 会让新 Chrome
+        join 现有 session 然后退出 ("Opening in existing browser session."))
+      - 用 config 指定的独立 user-data-dir (默认 ~/.hermes/cdp-chrome),
+        跟你 PWA Chrome (~/.hermes/chrome-debug) 物理隔开
+      - Wayland 自动检测 (Sway 没 DISPLAY 必须加, X11 桌面跳过)
+      - 复用 Hermes 3 个原子: get_chrome_debug_candidates, DEFAULT_BROWSER_CDP_PORT,
+        is_browser_debug_ready (在 _check_local_cdp)
+      - 进程用 start_new_session=True 脱离父进程 (Hermes 的 fire-and-forget 策略)
 
     Returns True if a Chromium-family browser is running and serving CDP.
     """
+    import platform
     try:
         from hermes_cli.browser_connect import (
-            try_launch_chrome_debug,
+            get_chrome_debug_candidates,
             DEFAULT_BROWSER_CDP_PORT,
         )
     except ImportError as exc:
         logger.warning("无法导入 hermes_cli.browser_connect: %s", exc)
         return False
 
-    # 从 CDP_URL 推端口 (默认 9222)
+    # --- user-data-dir: config 驱动, 默认 ~/.hermes/cdp-chrome ---
+    # 重要: 跟 ~/.hermes/chrome-debug 物理隔开 (Chrome 单 instance lock 是
+    # user-data-dir 级别的, 同 user-data-dir 第二个进程会被 lock 拦)
+    cfg = _load_cdp_config()
+    user_data_dir = cfg.get("local_chrome_profile") or os.path.expanduser(
+        "~/.hermes/cdp-chrome"
+    )
+    os.makedirs(user_data_dir, exist_ok=True)
+    logger.info("cdp-extract Chrome user-data-dir: %s", user_data_dir)
+
+    # --- Wayland (Sway 没 DISPLAY 必须加, X11 桌面跳过) ---
+    wayland_flag: list[str] = []
+    if platform.system() == "Linux" and not os.environ.get("DISPLAY"):
+        wayland_flag = ["--ozone-platform=wayland"]
+
+    # --- 端口 (从 CDP_URL 推, 默认 9222) ---
     try:
         port = int(CDP_URL.rsplit(":", 1)[-1].rstrip("/") or DEFAULT_BROWSER_CDP_PORT)
     except ValueError:
         port = DEFAULT_BROWSER_CDP_PORT
 
-    launched = try_launch_chrome_debug(port=port)
-    if not launched:
-        logger.warning("Hermes try_launch_chrome_debug 失败 (无候选浏览器)")
+    # --- 复用 Hermes 多浏览器探测 ---
+    candidates = get_chrome_debug_candidates(platform.system())
+    if not candidates:
+        logger.warning("未找到任何 Chromium-family 浏览器")
         return False
 
-    # 等 CDP 起来 (Hermes 文档说 5s 内, 我们给 10s)
-    for i in range(20):
-        if _check_local_cdp(CDP_URL):
-            logger.info("Hermes 本地 Chrome CDP 已就绪 (尝试 %d 次)", i + 1)
-            return True
-        time.sleep(0.5)
-
-    logger.warning("Hermes 启动 Chrome 但 10s 后 CDP 仍未就绪")
+    # --- 自己包装 Popen (start_new_session=True, 跟 Hermes 策略一致) ---
+    for candidate in candidates:
+        try:
+            subprocess.Popen(
+                [candidate,
+                 f"--remote-debugging-port={port}",
+                 f"--user-data-dir={user_data_dir}",
+                 "--no-first-run",
+                 "--no-default-browser-check",
+                 *wayland_flag,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            # 等 CDP 起来 (Hermes 文档说 5s 内, 我们给 10s; 在 Sway 桌面 Chrome
+            # 有时 startup 较慢 + 偶发 segfault 重启需要时间)
+            for i in range(20):
+                if _check_local_cdp(CDP_URL):
+                    logger.info("cdp-extract Chrome CDP 已就绪 (尝试 %d 次)", i + 1)
+                    return True
+                time.sleep(0.5)
+            logger.warning("启动 Chrome 10s 后 CDP 仍未就绪")
+            return False
+        except Exception as exc:
+            logger.debug("尝试 %s 失败: %s", candidate, exc)
+            continue
     return False
 
 
