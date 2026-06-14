@@ -3,4 +3,5 @@ __pycache__/
 *.pyo
 .DS_Store
 read_down/node_modules/
-/scripts/.tunnel.pid
+scripts/.tunnel.pid
+scripts/.chrome.pid

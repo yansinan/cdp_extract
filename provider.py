@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 from typing import Any, Dict, List
 
 import requests
@@ -90,11 +91,53 @@ def _check_local_cdp(cdp_url: str = CDP_URL) -> bool:
         return False
 
 
-def _ensure_cdp() -> bool:
-    """确保 CDP 可用。先检查本地，失败则尝试隧道。
+def _try_hermes_local_chrome() -> bool:
+    """调 Hermes 内置 try_launch_chrome_debug() 启动本地 Chromium-family 浏览器。
 
-    隧道配置在 config.yaml > plugins > cdp_extract 中。
-    如果设了 remote_host，则调用 cdp_tunnel.sh start 建立隧道。
+    Profile 路径用 Hermes 标准的 ~/.hermes/chrome-debug (与 /browser connect 一致)。
+    进程用 start_new_session=True 脱离父进程 — 我们管不到 PID, 但也不需要管:
+    下次 _check_local_cdp() 会反映真实状态。
+
+    Returns True if a Chromium-family browser is running and serving CDP.
+    """
+    try:
+        from hermes_cli.browser_connect import (
+            try_launch_chrome_debug,
+            DEFAULT_BROWSER_CDP_PORT,
+        )
+    except ImportError as exc:
+        logger.warning("无法导入 hermes_cli.browser_connect: %s", exc)
+        return False
+
+    # 从 CDP_URL 推端口 (默认 9222)
+    try:
+        port = int(CDP_URL.rsplit(":", 1)[-1].rstrip("/") or DEFAULT_BROWSER_CDP_PORT)
+    except ValueError:
+        port = DEFAULT_BROWSER_CDP_PORT
+
+    launched = try_launch_chrome_debug(port=port)
+    if not launched:
+        logger.warning("Hermes try_launch_chrome_debug 失败 (无候选浏览器)")
+        return False
+
+    # 等 CDP 起来 (Hermes 文档说 5s 内, 我们给 10s)
+    for i in range(20):
+        if _check_local_cdp(CDP_URL):
+            logger.info("Hermes 本地 Chrome CDP 已就绪 (尝试 %d 次)", i + 1)
+            return True
+        time.sleep(0.5)
+
+    logger.warning("Hermes 启动 Chrome 但 10s 后 CDP 仍未就绪")
+    return False
+
+
+def _ensure_cdp() -> bool:
+    """确保 CDP 可用。
+
+    决策链:
+      ① 本地 CDP (port 9222) 可达 → 直接用
+      ② 调 Hermes 内置 try_launch_chrome_debug 启动本地 Chrome
+      ③ 远端隧道 (仅当 remote_host 非空, 兼容旧配置)
     """
     global CDP_URL
     CDP_URL = _cdp_url_from_config()
@@ -102,12 +145,18 @@ def _ensure_cdp() -> bool:
     if _check_local_cdp(CDP_URL):
         return True
 
+    logger.info("本地 CDP 不可用, 尝试 Hermes 自动启动本地 Chrome")
+    if _try_hermes_local_chrome() and _check_local_cdp(CDP_URL):
+        return True
+
     cfg = _load_cdp_config()
-    if not cfg.get("remote_host"):
+    remote_host = (cfg.get("remote_host") or "").strip()
+    if not remote_host:
+        logger.warning("本地 Chrome 启动失败且未配置 remote_host, CDP 不可用")
         return False
 
-    logger.info("本地 CDP 不可用，尝试远程隧道 %s@%s",
-                cfg.get("remote_user"), cfg.get("remote_host"))
+    logger.info("本地 Chrome 启动失败, 回落隧道 %s@%s",
+                cfg.get("remote_user"), remote_host)
 
     if not os.path.isfile(TUNNEL_SCRIPT):
         logger.warning("隧道脚本不存在: %s", TUNNEL_SCRIPT)
