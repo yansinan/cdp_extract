@@ -14,8 +14,8 @@ Hermes 通过以下方式管理这个实例：
 ### 检查是否已安装
 
 ```bash
-# 方式 1：Hermes 集成方式（推荐）
-hermes browser status
+# 方式 1：在 Hermes 对话框中运行
+/browser status
 
 # 方式 2：直接探 CDP 端口
 curl -s http://127.0.0.1:9222/json/version | python3 -c "import json,sys;print('✅ CDP OK' if json.load(sys.stdin).get('webSocketDebuggerUrl') else '❌')"
@@ -24,10 +24,10 @@ curl -s http://127.0.0.1:9222/json/version | python3 -c "import json,sys;print('
 ps aux | grep -E 'chrome.*remote-debugging' | grep -v grep
 ```
 
-没装的话：
+没装的话，在 Hermes 对话框中运行：
 
 ```bash
-hermes browser connect    # 自动检测并启动
+/browser connect    # 自动检测并启动 agent 专用 Chrome
 ```
 
 ### 如果没有 agent-browser，会发生什么
