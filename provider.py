@@ -529,12 +529,34 @@ class CDPExtractProvider(WebSearchProvider):
         """检查本地 CDP (port 9222) 和 Node.js 是否可用。
         
         本地不可用时，如果配置了 remote_host，自动尝试远程隧道。
+
+        常见失败原因：
+        - Node.js 未安装 → 安装 nodejs
+        - 本地 Chrome CDP 端口 9222 不可达 → 运行 `hermes browser connect`
+        - 未找到 Chromium 浏览器 → 安装 Google Chrome 或 Chromium
         """
         try:
             subprocess.run(["node", "--version"], capture_output=True, timeout=5)
-        except Exception:
+        except FileNotFoundError:
+            logger.warning("❌ Node.js 未安装。cdp-extract 需要 Node.js ≥ 18 运行 read_down 管道。")
             return False
-        return _ensure_cdp()
+        except Exception as exc:
+            logger.warning("❌ Node.js 检查失败: %s", exc)
+            return False
+
+        if _check_local_cdp():
+            return True
+
+        logger.warning("⚠ CDP 端口 9222 不可达。尝试 Hermes local browser launcher...")
+        if _try_hermes_local_chrome():
+            return True
+
+        logger.warning(
+            "❌ 本地 CDP 不可用且无法启动 Chrome。"
+            "请运行 `hermes browser connect` 安装 agent-browser，"
+            "或确认 Chrome/Chromium 已在 9222 端口开启远程调试。"
+        )
+        return False
 
     def supports_search(self) -> bool:
         return False

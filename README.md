@@ -1,6 +1,50 @@
 # cdp-extract — CDP 网页内容提取插件
 
-**依赖：本地 Chrome/Chromium 需开启远程调试（`--remote-debugging-port=9222`）**
+## 前置要求（必读）
+
+### 关键依赖：`agent-browser`
+
+**cdp-extract 通过 Chrome DevTools Protocol (CDP) 抓取网页。** 本地必须有一个 Chrome/Chromium 实例在 port 9222 上开启远程调试。
+
+Hermes 通过以下方式管理这个实例：  
+
+→ **`/browser connect`** 启动 agent 专用 Chrome（user-data-dir: `~/.hermes/chrome-debug/`）  
+→ 没有它，cdp-extract 就无法工作，Hermes 会无声降级回 `curl` 提取
+
+### 检查是否已安装
+
+```bash
+# 方式 1：Hermes 集成方式（推荐）
+hermes browser status
+
+# 方式 2：直接探 CDP 端口
+curl -s http://127.0.0.1:9222/json/version | python3 -c "import json,sys;print('✅ CDP OK' if json.load(sys.stdin).get('webSocketDebuggerUrl') else '❌')"
+
+# 方式 3：查看进程
+ps aux | grep -E 'chrome.*remote-debugging' | grep -v grep
+```
+
+没装的话：
+
+```bash
+hermes browser connect    # 自动检测并启动
+```
+
+### 如果没有 agent-browser，会发生什么
+
+```
+Hermes 需要提取网页内容
+  → cdp-extract 插件 is_available() 返回 False（CDP 端口不可达）
+  → Hermes 无声降级到 curl（web_extract 兜底）
+  → curl 拿不到 JS 渲染后的内容，只返回静态 HTML
+  → 用户看到"提取不完整"、"页面内容为空"
+  → 排查半天，发现是 agent-browser 没装
+```
+
+### 其他依赖
+
+- **Node.js ≥ 18**（read_down 管道运行环境）
+- `linkedom` + `@mozilla/readability` + `turndown`（已纳入 `read_down/package.json`，`npm install` 即可）
 
 Hermes Agent 的 `web_extract` provider。通过本地 Chrome DevTools Protocol 打开网页，
 滚动到底触发懒加载，获取完整 HTML，再经 Readability + Turndown 管道输出结构化 Markdown。
