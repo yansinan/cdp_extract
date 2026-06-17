@@ -16,7 +16,7 @@ Hermes 通过以下方式管理这个实例：
 **推荐的一键检查：**
 
 ```bash
-AGENT_BROWSER=~/.hermes/node/bin/agent-browser; \
+AGENT_BROWSER="$HERMES_HOME/node/bin/agent-browser"; \
 if [ ! -x "$AGENT_BROWSER" ]; then echo "❌ 未安装"; exit 1; fi; \
 echo "✅ $("$AGENT_BROWSER" --version)"; \
 CDP=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9222/json/version 2>/dev/null); \
@@ -35,7 +35,7 @@ if pgrep -f "chrome.*remote-debugging.*9222" >/dev/null 2>&1; then echo "✅ Chr
 
 ```bash
 # agent-browser 二进制是否存在
-~/.hermes/node/bin/agent-browser --version
+"$HERMES_HOME/node/bin/agent-browser" --version
 
 # CDP 端口是否在响应
 curl -s http://127.0.0.1:9222/json/version | python3 -m json.tool 2>/dev/null | head -3
