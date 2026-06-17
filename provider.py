@@ -237,17 +237,23 @@ def _ensure_cdp() -> bool:
     return _check_local_cdp()
 
 
-def _call_readdown(html: str, url: str = "", debug: bool = False) -> Dict[str, Any]:
+def _call_readdown(html: str, url: str = "", debug: bool = False, **extra) -> Dict[str, Any]:
     """调用 read_down (Node.js) 处理原始 HTML，返回结构化结果。
 
     CLI 接口:
-      stdin  → {"html": "...", "url": "...", "options": {"debugTrace": bool}}
+      stdin  → {"html": "...", "url": "...", "options": {...}}
       stdout → {"markdown": "...", "text": "...", "title": "...", ...}
+
+    Args:
+        html: 原始页面 HTML
+        url: 页面 URL（用于 Readability 的 base URL 解析）
+        debug: 是否输出调试信息
+        **extra: 透传到 read_down 的 options（如 useReadability, skipTurndown 等）
     """
     payload = {
         "html": html,
         "url": url,
-        "options": {"debugTrace": debug},
+        "options": {"debugTrace": debug, **extra},
     }
 
     try:
@@ -574,7 +580,12 @@ class CDPExtractProvider(WebSearchProvider):
         return False
 
     def supports_search(self) -> bool:
-        return False
+        return True
+
+    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+        """CDP browser-backed search (skip Hermes registry to avoid recursion)."""
+        from .search import multi_search
+        return multi_search(query, limit=limit, skip_backend=True)
 
     def supports_extract(self) -> bool:
         return True
