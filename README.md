@@ -13,21 +13,41 @@ Hermes 通过以下方式管理这个实例：
 
 ### 检查是否已安装
 
+**推荐的一键检查：**
+
 ```bash
-# 方式 1：在 Hermes 对话框中运行
-/browser status
-
-# 方式 2：直接探 CDP 端口
-curl -s http://127.0.0.1:9222/json/version | python3 -c "import json,sys;print('✅ CDP OK' if json.load(sys.stdin).get('webSocketDebuggerUrl') else '❌')"
-
-# 方式 3：查看进程
-ps aux | grep -E 'chrome.*remote-debugging' | grep -v grep
+AGENT_BROWSER=~/.hermes/node/bin/agent-browser; \
+if [ ! -x "$AGENT_BROWSER" ]; then echo "❌ 未安装"; exit 1; fi; \
+echo "✅ $("$AGENT_BROWSER" --version)"; \
+CDP=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9222/json/version 2>/dev/null); \
+if [ "$CDP" = "200" ]; then echo "✅ CDP 9222 可达"; else echo "❌ CDP 9222 不可达"; fi; \
+if pgrep -f "chrome.*remote-debugging.*9222" >/dev/null 2>&1; then echo "✅ Chrome CDP 进程运行中"; else echo "❌ 无 Chrome CDP 进程"; fi
 ```
 
-没装的话，在 Hermes 对话框中运行：
+正确输出示例（三段全绿才算可用）：
+```
+✅ agent-browser 0.27.0
+✅ CDP 9222 可达
+✅ Chrome CDP 进程运行中
+```
+
+**单项检查：**
 
 ```bash
-/browser connect    # 自动检测并启动 agent 专用 Chrome
+# agent-browser 二进制是否存在
+~/.hermes/node/bin/agent-browser --version
+
+# CDP 端口是否在响应
+curl -s http://127.0.0.1:9222/json/version | python3 -m json.tool 2>/dev/null | head -3
+
+# Chrome 进程是否存活
+ps aux | grep -E 'chrome.*remote-debugging.*9222' | grep -v grep
+```
+
+没装的话：
+
+```bash
+npm install -g agent-browser
 ```
 
 ### 如果没有 agent-browser，会发生什么
