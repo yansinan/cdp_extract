@@ -25,7 +25,6 @@ from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
-CDP_URL = "http://127.0.0.1:9222"
 PAGE_TIMEOUT = 30  # 单次 CDP 命令超时
 TUNNEL_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -53,9 +52,21 @@ def _load_cdp_config() -> dict:
 
 
 def _cdp_url_from_config() -> str:
-    """返回实际的 CDP URL（可配置）。"""
+    """从 config.yaml 构建 CDP URL。
+
+    优先级: cdp_url (完整URL) > local_port 构造 > 默认 9222。
+    始终从配置读取，无模块级硬编码。
+    """
     cfg = _load_cdp_config()
-    return cfg.get("cdp_url", CDP_URL)
+    url = cfg.get("cdp_url") or ""
+    if url:
+        return url.rstrip("/")
+    try:
+        from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_PORT as DEFAULT_PORT
+    except ImportError:
+        DEFAULT_PORT = 9222
+    port = int(cfg.get("local_port", DEFAULT_PORT))
+    return f"http://127.0.0.1:{port}"
 
 
 def _build_tunnel_env(cfg: dict) -> dict:
@@ -82,8 +93,10 @@ def _build_tunnel_env(cfg: dict) -> dict:
     return env
 
 
-def _check_local_cdp(cdp_url: str = CDP_URL) -> bool:
+def _check_local_cdp(cdp_url: str | None = None) -> bool:
     """检查本地 CDP 端口是否可达。"""
+    if cdp_url is None:
+        cdp_url = _cdp_url_from_config()
     try:
         resp = requests.get(f"{cdp_url}/json/version", timeout=3)
         return resp.status_code == 200
@@ -133,10 +146,12 @@ def _try_hermes_local_chrome() -> bool:
     if platform.system() == "Linux" and not os.environ.get("DISPLAY"):
         wayland_flag = ["--ozone-platform=wayland"]
 
-    # --- 端口 (从 CDP_URL 推, 默认 9222) ---
+    # --- 端口 (从 config 读取) ---
     try:
-        port = int(CDP_URL.rsplit(":", 1)[-1].rstrip("/") or DEFAULT_BROWSER_CDP_PORT)
-    except ValueError:
+        port = int(
+            _cdp_url_from_config().rsplit(":", 1)[-1].rstrip("/")
+        )
+    except (ValueError, Exception):
         port = DEFAULT_BROWSER_CDP_PORT
 
     # --- 复用 Hermes 多浏览器探测 ---
@@ -163,7 +178,7 @@ def _try_hermes_local_chrome() -> bool:
             # 等 CDP 起来 (Hermes 文档说 5s 内, 我们给 10s; 在 Sway 桌面 Chrome
             # 有时 startup 较慢 + 偶发 segfault 重启需要时间)
             for i in range(20):
-                if _check_local_cdp(CDP_URL):
+                if _check_local_cdp():
                     logger.info("cdp-extract Chrome CDP 已就绪 (尝试 %d 次)", i + 1)
                     return True
                 time.sleep(0.5)
@@ -179,18 +194,15 @@ def _ensure_cdp() -> bool:
     """确保 CDP 可用。
 
     决策链:
-      ① 本地 CDP (port 9222) 可达 → 直接用
+      ① 本地 CDP 可达 → 直接用
       ② 调 Hermes 内置 try_launch_chrome_debug 启动本地 Chrome
       ③ 远端隧道 (仅当 remote_host 非空, 兼容旧配置)
     """
-    global CDP_URL
-    CDP_URL = _cdp_url_from_config()
-
-    if _check_local_cdp(CDP_URL):
+    if _check_local_cdp():
         return True
 
     logger.info("本地 CDP 不可用, 尝试 Hermes 自动启动本地 Chrome")
-    if _try_hermes_local_chrome() and _check_local_cdp(CDP_URL):
+    if _try_hermes_local_chrome() and _check_local_cdp():
         return True
 
     cfg = _load_cdp_config()
@@ -222,7 +234,7 @@ def _ensure_cdp() -> bool:
         logger.warning("隧道调用失败: %s", exc)
         return False
 
-    return _check_local_cdp(CDP_URL)
+    return _check_local_cdp()
 
 
 def _call_readdown(html: str, url: str = "", debug: bool = False) -> Dict[str, Any]:
@@ -274,7 +286,8 @@ def _get_browser_ws_url() -> str:
     文档: https://chromedevtools.github.io/devtools-protocol/tot/#endpoints
     GET /json/version → webSocketDebuggerUrl (ws://.../devtools/browser/<id>)
     """
-    resp = requests.get(f"{CDP_URL}/json/version", timeout=5)
+    cdp_url = _cdp_url_from_config()
+    resp = requests.get(f"{cdp_url}/json/version", timeout=5)
     resp.raise_for_status()
     return resp.json()["webSocketDebuggerUrl"]
 
@@ -296,7 +309,8 @@ async def _create_target(browser_ws: str) -> tuple[str, str]:
         target_id = result["result"]["targetId"]
 
     # 从 REST 接口获取对应 page 的 WS URL
-    targets_resp = requests.get(f"{CDP_URL}/json", timeout=5)
+    cdp_url = _cdp_url_from_config()
+    targets_resp = requests.get(f"{cdp_url}/json", timeout=5)
     for t in targets_resp.json():
         if t["id"] == target_id:
             return target_id, t["webSocketDebuggerUrl"]
@@ -311,7 +325,8 @@ def _close_target(target_id: str) -> None:
     GET /json/close/<targetId>
     """
     try:
-        requests.get(f"{CDP_URL}/json/close/{target_id}", timeout=5)
+        cdp_url = _cdp_url_from_config()
+        requests.get(f"{cdp_url}/json/close/{target_id}", timeout=5)
     except Exception as exc:
         logger.warning("关闭标签页失败 %s: %s", target_id, exc)
 
