@@ -628,10 +628,17 @@ class CDPExtractProvider(WebSearchProvider):
             )
 
             # 合并：CDP 标题作 fallback，read_down 字段优先
+            # 关键：补齐 `content` 和 `raw_content` 字段（web_tools.py 期望的字段名）
+            #   - `content`   ← `markdown`（web_extract 最终输出给模型的字段）
+            #   - `raw_content` ← `text`（LLM 摘要环节读取的字段）
+            text_value = rd_result.get("text", "")
+            markdown_value = rd_result.get("markdown") or ""
             merged = {
                 "url": url,
-                "text": rd_result.get("text", ""),
-                "markdown": rd_result.get("markdown"),
+                "text": text_value,
+                "markdown": markdown_value,
+                "content": markdown_value,        # 对齐 web_tools.py:1146
+                "raw_content": text_value,        # 对齐 web_tools.py:1069
                 "html": rd_result.get("html"),
                 "title": rd_result.get("title") or raw.get("title"),
                 "byline": rd_result.get("byline"),
